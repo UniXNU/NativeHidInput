@@ -42,6 +42,78 @@ static const unsigned char touchDescriptor[]={
     0x09,0x54,0x75,0x08,0x95,0x01,0x15,0x00,0x26,0xff,0x00,0x81,0x02,0xc0
 };
 #define TOUCH_FINGERS 10
+// Edge contacts (int-163). A contact that starts within ~3 mm of a panel edge carries kIOHIDDigitizerEventFromEdgeTip (0x800) in its
+// finger events' event mask for its whole life, as Apple's multitouch stack reports it (MultitouchHID). UIKit derives UITouch's edge
+// type from that bit alone (_UIEventHIDTouchEdgeTypeForHIDEvent: 0x800/0x1000/0x2000/0x40000 -> 1..4), and every screen-edge
+// recognizer of SpringBoard fails at once on edge type 0: int-162 logged edge=0 for touches starting 2 pt above the bottom edge and
+// SBHomeGesturePanGestureRecognizer / SBFluidSwitcherScreenEdgePanGestureRecognizer going 0->5, so no home or switcher gesture.
+// The original IOHIDEventDriver (IOHIDFamily-2031.120.4) never sets the bit. Its dispatchEvent (IOHIDEventService slot 198, the slot
+// 37 of IOHIDFamily's indirect calls use) is wrapped for this device's driver only, in a copy of its vtable; the wrapper adds the bit
+// to the finger children of each digitizer collection and calls the original. IOHIDEvent virtuals of that version: getType 18,
+// getIntegerValue 23, setIntegerValue 24, getFixedValue 25 (setIntegerValue/getIntegerValue at +0xc0/+0xb8 in the driver's own
+// calls); _children at +24 (IOHIDEvent.h; appendChild stores into it and free releases it). _parent is never set (appendChild only
+// stores the child, int-163 skipped every finger by comparing it), so each child is an IOHIDEvent by its class instead.
+namespace edge {
+enum {kSlots=256,kDispatch=198,kGetType=18,kGetInteger=23,kSetInteger=24,kGetFixed=25,kContacts=256};
+enum : uint32_t {kDigitizer=11,kX=0xB0000,kY=0xB0001,kIndex=0xB0005,kMask=0xB0007,kTouch=0xB0009,kMaskTouch=2,kFromEdgeTip=0x800};
+// 48 panel pixels of 3048 x 2032 (the sweet reference uses 48 px), in the driver's normalised IOFixed coordinates.
+static const int32_t kEdgeX=48*65536/3048,kEdgeY=48*65536/2032;
+static uintptr_t originalDispatch;
+static bool fromEdge[kContacts];
+extern "C" {volatile uint32_t native_touch_edge_stats[4];}   // [0] installed, [1] contacts begun, [2] of them at an edge, [3] skipped events
+template <typename R,typename... A> static R call(void *object,unsigned slot,A... args) {
+    return reinterpret_cast<R (*)(void *,A...)>((*reinterpret_cast<uintptr_t **>(object))[slot])(object,args...);
+}
+// One finger event; true when it now carries the bit.
+static bool mark(void *child) {
+    if(call<uint32_t,IOOptionBits>(child,kGetType,0)!=kDigitizer)return false;   // the scan-time vendor child
+    const uint32_t index=(uint32_t)call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kIndex,0);
+    if(index>=kContacts) {native_touch_edge_stats[3]=native_touch_edge_stats[3]+1;return false;}
+    const uint32_t mask=(uint32_t)call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kMask,0);
+    const bool touch=call<int32_t,uint32_t,IOOptionBits>(child,kGetInteger,kTouch,0)!=0;
+    if((mask&kMaskTouch) && touch) {   // the contact begins: its position now decides
+        const int32_t x=call<int32_t,uint32_t,IOOptionBits>(child,kGetFixed,kX,0),y=call<int32_t,uint32_t,IOOptionBits>(child,kGetFixed,kY,0);
+        fromEdge[index]=x<kEdgeX || x>65536-kEdgeX || y<kEdgeY || y>65536-kEdgeY;
+        native_touch_edge_stats[1]=native_touch_edge_stats[1]+1;
+        if(fromEdge[index])native_touch_edge_stats[2]=native_touch_edge_stats[2]+1;
+    }
+    const bool edged=fromEdge[index];
+    if(edged)call<void,uint32_t,int32_t,IOOptionBits>(child,kSetInteger,kMask,(int32_t)(mask|kFromEdgeTip),0);
+    if(!touch && (mask&kMaskTouch))fromEdge[index]=false;   // the lift keeps the bit; the next contact with this index starts fresh
+    return edged;
+}
+static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
+    if(event && call<uint32_t,IOOptionBits>(event,kGetType,0)==kDigitizer) {
+        OSArray *children=*reinterpret_cast<OSArray **>(reinterpret_cast<uint8_t *>(event)+24);
+        if(children && OSDynamicCast(OSArray,children) && children->getCount()) {
+            // A collection (the driver's touch-screen dispatch): its mask is the union of its fingers', so it takes the bit as well.
+            bool any=false;
+            for(unsigned i=0;i<children->getCount();++i) {
+                OSObject *child=children->getObject(i);
+                if(child && child->metaCast("IOHIDEvent"))any|=mark(child);
+                else native_touch_edge_stats[3]=native_touch_edge_stats[3]+1;
+            }
+            if(any) {
+                const uint32_t mask=(uint32_t)call<int32_t,uint32_t,IOOptionBits>(event,kGetInteger,kMask,0);
+                call<void,uint32_t,int32_t,IOOptionBits>(event,kSetInteger,kMask,(int32_t)(mask|kFromEdgeTip),0);
+            }
+        } else if(!children) mark(event);   // one transducer dispatched on its own
+    }
+    reinterpret_cast<void (*)(IOService *,OSObject *,IOOptionBits)>(originalDispatch)(self,event,options);
+}
+// This device's own event driver gets the wrapped copy; any other driver keeps the original table.
+static void install(IORegistryEntry *driver) {
+    if(originalDispatch || !driver)return;
+    uintptr_t *table=*reinterpret_cast<uintptr_t **>(driver);
+    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(kSlots*sizeof(uintptr_t)));
+    if(!copy)return;
+    memcpy(copy,table,kSlots*sizeof(uintptr_t));
+    originalDispatch=copy[kDispatch];copy[kDispatch]=(uintptr_t)&dispatch;
+    __asm__ volatile("dmb ish":::"memory");
+    *reinterpret_cast<uintptr_t **>(driver)=copy;
+    native_touch_edge_stats[0]=1;
+}
+}  // namespace edge
 class NativeHidInput : public IOHIDDevice {
     OSDeclareDefaultStructors(NativeHidInput)
     IOWorkLoop *inputLoop=nullptr;
@@ -105,16 +177,24 @@ class NativeHidInput : public IOHIDDevice {
         native_touch_hid_reports=native_touch_hid_reports+1;
     }
     bool hasEventDriverCached() {
-        if(!eventDriverFound)eventDriverFound=hasEventDriver(this,4);
+        if(!eventDriverFound) {
+            IORegistryEntry *driver=eventDriver(this,4);
+            eventDriverFound=driver!=nullptr;
+            if(driver && (touchEnabled || touchOnly))edge::install(driver);
+        }
         return eventDriverFound;
     }
-    static bool hasEventDriver(IORegistryEntry *parent,unsigned depth) {
-        if(!depth)return false;
-        OSIterator *it=parent->getChildIterator(gIOServicePlane);if(!it)return false;
-        bool found=false;
+    static bool hasEventDriver(IORegistryEntry *parent,unsigned depth) {return eventDriver(parent,depth)!=nullptr;}
+    // The IOHIDEventDriver below this device, if one has attached.
+    static IORegistryEntry *eventDriver(IORegistryEntry *parent,unsigned depth) {
+        if(!depth)return nullptr;
+        OSIterator *it=parent->getChildIterator(gIOServicePlane);if(!it)return nullptr;
+        IORegistryEntry *found=nullptr;
         while(OSObject *child=it->getNextObject()) {
             IORegistryEntry *entry=OSDynamicCast(IORegistryEntry,child);
-            if(entry && (entry->metaCast("IOHIDEventDriver") || hasEventDriver(entry,depth-1))) {found=true;break;}
+            if(!entry)continue;
+            found=entry->metaCast("IOHIDEventDriver")?entry:eventDriver(entry,depth-1);
+            if(found)break;
         }
         it->release();return found;
     }
