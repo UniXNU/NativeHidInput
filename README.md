@@ -1,5 +1,7 @@
 # NativeHidInput
 
-HID input driver.
+HID input driver. Publishes keyboard, pointer and touch events to IOHIDFamily.
 
-Maintained as an independent module and included by [UniXNU](https://github.com/UniXNU/UniXNU) at `drivers/NativeHidInput`.
+Current state: used by the sheng touch path.
+
+Linked into XNU by `unixnu build kernel`.
