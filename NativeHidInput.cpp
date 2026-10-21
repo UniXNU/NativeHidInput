@@ -10,6 +10,7 @@
 extern "C" void native_hid_input_observed(unsigned,int);
 extern "C" void native_hid_live_checkpoint(IOService *);
 extern "C" bool native_hid_input_requested(void);
+extern "C" void native_touch_set_sink(void (*)(void *), void *) __attribute__((weak_import));
 // Optional touch digitizer fed by the board touch probe (kits/sheng/TouchProbe.cpp): finger set published with a seqlock.
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
@@ -118,7 +119,6 @@ class NativeHidInput : public IOHIDDevice {
     OSDeclareDefaultStructors(NativeHidInput)
     IOWorkLoop *inputLoop=nullptr;
     IOTimerEventSource *timer=nullptr;
-    IOTimerEventSource *touchTimer=nullptr;
     bool down=false;
     bool touchEnabled=false;
     // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
@@ -133,9 +133,19 @@ class NativeHidInput : public IOHIDDevice {
         if(value<0)value=0;if(value>=maximum)value=maximum-1;
         return (unsigned)((long long)value*32767/(maximum-1));
     }
-    static void touchTick(OSObject *owner,IOTimerEventSource *source) {
-        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
-        source->setTimeoutMS(8);
+    // One finger set to the event driver. The touch thread (kits/sheng/TouchProbe.cpp) calls touchNotify after it publishes a frame; there is no timer
+    // watching the seqlock any more (it woke the work loop every 8 ms for nothing).
+    static void touchNotify(void *context) {
+        NativeHidInput *self=static_cast<NativeHidInput *>(context);
+        if(self && self->inputLoop)self->inputLoop->runAction(&NativeHidInput::touchAction,self);
+    }
+    static IOReturn touchAction(OSObject *owner,void *,void *,void *,void *) {
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
+        self->touchSend();
+        return kIOReturnSuccess;
+    }
+    void touchSend() {
+        NativeHidInput *self=this;
         if(!self->hasEventDriverCached())return;
         uint32_t before=native_touch_seq;
         if((before&1) || before==self->lastSeq)return;
@@ -252,16 +262,14 @@ public:
             OSSafeReleaseNULL(timer);IOHIDDevice::stop(provider);return false;
         }
         if(touchOnly||touchEnabled) {
-            touchTimer=IOTimerEventSource::timerEventSource(this,touchTick);
-            if(touchTimer && inputLoop->addEventSource(touchTimer)==kIOReturnSuccess)touchTimer->setTimeoutMS(1000);
-            else OSSafeReleaseNULL(touchTimer);
+            if(&native_touch_set_sink)native_touch_set_sink(&NativeHidInput::touchNotify,this);
         }
         setProperty("OfflineInputProbe",true);
         native_hid_input_observed(2,0);
         timer->setTimeoutMS(1000);return true;
     }
     void stop(IOService *provider) override {
-        if(touchTimer){touchTimer->cancelTimeout();inputLoop->removeEventSource(touchTimer);OSSafeReleaseNULL(touchTimer);}
+        if((touchOnly||touchEnabled) && &native_touch_set_sink)native_touch_set_sink(nullptr,nullptr);
         if(timer){timer->cancelTimeout();inputLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
         IOHIDDevice::stop(provider);
     }
