@@ -65,6 +65,8 @@ static const int32_t kEdgeX=48*65536/3048,kEdgeY=48*65536/2032;
 static uintptr_t originalDispatch;
 static bool fromEdge[kContacts];
 extern "C" {volatile uint32_t native_touch_edge_stats[4];}   // [0] installed, [1] contacts begun, [2] of them at an edge, [3] skipped events
+// [0] reports with two or more fingers down, [1] the most fingers down in one report, [2] tip-up entries sent for vanished fingers
+extern "C" {volatile uint32_t native_touch_hid_multi[3];}
 template <typename R,typename... A> static R call(void *object,unsigned slot,A... args) {
     return reinterpret_cast<R (*)(void *,A...)>((*reinterpret_cast<uintptr_t **>(object))[slot])(object,args...);
 }
@@ -171,6 +173,8 @@ class NativeHidInput : public IOHIDDevice {
             nextIds[slot]=ids[i];nextX[slot]=(int)x;nextY[slot]=(int)y;
         }
         const unsigned downCount=slot;
+        if(downCount>=2)edge::native_touch_hid_multi[0]=edge::native_touch_hid_multi[0]+1;
+        if(downCount>edge::native_touch_hid_multi[1])edge::native_touch_hid_multi[1]=downCount;
         // Identifiers that were down and are gone: tip up at the last known position. They are matched by identifier, not by slot:
         // the producer packs its fingers, so when one lifts the others move down a slot and a slot match would lift a finger still
         // down and leave the lifted one stuck.
@@ -184,7 +188,7 @@ class NativeHidInput : public IOHIDDevice {
             f[0]=2;f[1]=(unsigned char)(id&0xff);
             f[2]=(unsigned char)self->prevX[j];f[3]=(unsigned char)(self->prevX[j]>>8);
             f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
-            ++slot;
+            ++slot;edge::native_touch_hid_multi[2]=edge::native_touch_hid_multi[2]+1;
         }
         for(unsigned j=0;j<TOUCH_FINGERS;++j) {
             self->prevIds[j]=j<downCount?nextIds[j]:-1;
