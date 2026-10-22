@@ -11,14 +11,17 @@ extern "C" void native_hid_input_observed(unsigned,int);
 extern "C" void native_hid_live_checkpoint(IOService *);
 extern "C" bool native_hid_input_requested(void);
 extern "C" void native_touch_set_sink(void (*)(void *), void *) __attribute__((weak_import));
+// Optional hardware buttons fed by the board button driver: a mask of report 2 bits, sent on every change.
+extern "C" void native_buttons_set_sink(void (*)(void *, uint32_t), void *) __attribute__((weak_import));
 // Optional touch digitizer fed by the board touch probe (kits/sheng/TouchProbe.cpp): finger set published with a seqlock.
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 }
 // Keyboard Application collection ensures the original generic keyboard
-// personality can match. Report 2 carries Consumer Menu, not a claimed result
-// that the system accepted Home. Report 1 is an ordinary boot keyboard report.
+// personality can match. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
+// bit 1 Power, bit 2 Volume Increment, bit 3 Volume Decrement. Report 1 is an
+// ordinary boot keyboard report.
 static const unsigned char descriptor[]={
     0x05,0x01,0x09,0x06,0xa1,0x01,0x85,0x01,
     0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,
@@ -26,9 +29,9 @@ static const unsigned char descriptor[]={
     0x75,0x08,0x95,0x01,0x81,0x03,
     0x19,0x00,0x29,0x65,0x15,0x00,0x25,0x65,
     0x75,0x08,0x95,0x06,0x81,0x00,
-    0x85,0x02,0x05,0x0c,0x09,0x40,0x15,0x00,0x25,0x01,
-    0x75,0x01,0x95,0x01,0x81,0x02,
-    0x75,0x07,0x95,0x01,0x81,0x03,0xc0
+    0x85,0x02,0x05,0x0c,0x09,0x40,0x09,0x30,0x09,0xe9,0x09,0xea,0x15,0x00,0x25,0x01,
+    0x75,0x01,0x95,0x04,0x81,0x02,
+    0x75,0x04,0x95,0x01,0x81,0x03,0xc0
 };
 // Report 3: ten-finger Touch Screen collection (Tip Switch, Untouch (set when the tip is up), Contact Identifier, X, Y per finger, then Contact Count).
 // Coordinates are normalised to 0..32767 on both axes by the producer.
@@ -120,6 +123,7 @@ class NativeHidInput : public IOHIDDevice {
     IOWorkLoop *inputLoop=nullptr;
     IOTimerEventSource *timer=nullptr;
     bool down=false;
+    uint8_t buttons=0;   // report 2 bits held by the hardware buttons
     bool touchEnabled=false;
     // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
     // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
@@ -186,6 +190,22 @@ class NativeHidInput : public IOHIDDevice {
         native_hid_input_observed(6,result);
         native_touch_hid_reports=native_touch_hid_reports+1;
     }
+    // The button driver's thread calls buttonsNotify on every change of the pressed set.
+    static void buttonsNotify(void *context,uint32_t mask) {
+        NativeHidInput *self=static_cast<NativeHidInput *>(context);
+        if(self && self->inputLoop)self->inputLoop->runAction(&NativeHidInput::buttonsAction,self,reinterpret_cast<void *>(uintptr_t(mask)));
+    }
+    static IOReturn buttonsAction(OSObject *owner,void *mask,void *,void *,void *) {
+        NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
+        self->buttons=static_cast<uint8_t>(uintptr_t(mask)&0xe);
+        if(!self->hasEventDriverCached())return kIOReturnSuccess;
+        unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|self->buttons)};
+        IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
+        IOReturn result=buffer?self->handleReport(buffer,0,0):kIOReturnNoMemory;
+        OSSafeReleaseNULL(buffer);
+        native_hid_input_observed(4,result);
+        return kIOReturnSuccess;
+    }
     bool hasEventDriverCached() {
         if(!eventDriverFound) {
             IORegistryEntry *driver=eventDriver(this,4);
@@ -219,7 +239,7 @@ class NativeHidInput : public IOHIDDevice {
         }
         native_hid_input_observed(3,1);
         if(!self->down && !native_hid_input_requested()) {source->setTimeoutMS(1000);return;}
-        unsigned char report[]={2,static_cast<unsigned char>(self->down?0:1)};
+        unsigned char report[]={2,static_cast<unsigned char>((self->down?0:1)|self->buttons)};
         IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
         IOReturn result=buffer?self->handleReport(buffer,0,0):kIOReturnNoMemory;
         OSSafeReleaseNULL(buffer);
@@ -264,12 +284,14 @@ public:
         if(touchOnly||touchEnabled) {
             if(&native_touch_set_sink)native_touch_set_sink(&NativeHidInput::touchNotify,this);
         }
+        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(&NativeHidInput::buttonsNotify,this);
         setProperty("OfflineInputProbe",true);
         native_hid_input_observed(2,0);
         timer->setTimeoutMS(1000);return true;
     }
     void stop(IOService *provider) override {
         if((touchOnly||touchEnabled) && &native_touch_set_sink)native_touch_set_sink(nullptr,nullptr);
+        if(!touchOnly && &native_buttons_set_sink)native_buttons_set_sink(nullptr,nullptr);
         if(timer){timer->cancelTimeout();inputLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
         IOHIDDevice::stop(provider);
     }
