@@ -33,7 +33,9 @@ static const unsigned char descriptor[]={
     0x75,0x01,0x95,0x04,0x81,0x02,
     0x75,0x04,0x95,0x01,0x81,0x03,0xc0
 };
-// Report 3: ten-finger Touch Screen collection (Tip Switch, Untouch (set when the tip is up), Contact Identifier, X, Y per finger, then Contact Count).
+// Report 3: ten-finger Touch Screen collection (Tip Switch, Touch Valid, Contact Identifier, X, Y per finger, then Contact Count).
+// Touch Valid (0x47) is the finger confidence: IOHIDEventDriver turns a finger transducer whose value is 0 into a hand (palm), which
+// multi-finger and system edge gestures ignore, so every finger, down or lifting, sends 1.
 // Coordinates are normalised to 0..32767 on both axes by the producer.
 #define FINGER_DESC \
     0x09,0x22,0xa1,0x02, 0x09,0x42,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x01,0x81,0x02, 0x09,0x47,0x81,0x02, 0x75,0x06,0x95,0x01,0x81,0x03, \
@@ -169,7 +171,7 @@ class NativeHidInput : public IOHIDDevice {
         for(unsigned i=0;i<count && slot<TOUCH_FINGERS;++i,++slot) {
             unsigned x=transformCoordinate(xs[i],30480),y=transformCoordinate(ys[i],20320);
             unsigned char *f=report+1+slot*6;
-            f[0]=1;f[1]=(unsigned char)(ids[i]&0xff);f[2]=(unsigned char)x;f[3]=(unsigned char)(x>>8);f[4]=(unsigned char)y;f[5]=(unsigned char)(y>>8);
+            f[0]=3;f[1]=(unsigned char)(ids[i]&0xff);f[2]=(unsigned char)x;f[3]=(unsigned char)(x>>8);f[4]=(unsigned char)y;f[5]=(unsigned char)(y>>8);   // tip, valid
             nextIds[slot]=ids[i];nextX[slot]=(int)x;nextY[slot]=(int)y;
         }
         const unsigned downCount=slot;
@@ -185,7 +187,7 @@ class NativeHidInput : public IOHIDDevice {
             for(unsigned i=0;i<downCount && !kept;++i)kept=(ids[i]&0xff)==(id&0xff);
             if(kept || slot>=TOUCH_FINGERS)continue;
             unsigned char *f=report+1+slot*6;
-            f[0]=2;f[1]=(unsigned char)(id&0xff);
+            f[0]=2;f[1]=(unsigned char)(id&0xff);   // tip up, valid
             f[2]=(unsigned char)self->prevX[j];f[3]=(unsigned char)(self->prevX[j]>>8);
             f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
             ++slot;edge::native_touch_hid_multi[2]=edge::native_touch_hid_multi[2]+1;
