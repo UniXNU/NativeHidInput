@@ -289,7 +289,11 @@ public:
         if(!setProperty("HIDDefaultBehavior",true))return false;
         unsigned touch=0;
         touchEnabled=PE_parse_boot_argn("sheng-touch-hid",&touch,sizeof(touch)) && touch==1;
-        if(touchOnly||touchEnabled){setProperty("Built-In",true);setProperty("DisplayIntegrated",true);}
+        // DigitizerCollectionDispatch: IOHIDEventDriver (setDigitizerProperties) reads it up the service plane and then sends each
+        // report's fingers as one digitizer collection with a child per finger. Without it a touch screen gets one event per finger,
+        // and backboardd takes each as the whole touch set, so no two fingers are ever down together for UIKit (no pinch, no
+        // multi-finger or system gestures).
+        if(touchOnly||touchEnabled){setProperty("Built-In",true);setProperty("DisplayIntegrated",true);setProperty("DigitizerCollectionDispatch",true);}
         if(!IOHIDDevice::start(provider))return false;
         timer=IOTimerEventSource::timerEventSource(this,tick);
         if(!timer || inputLoop->addEventSource(timer)!=kIOReturnSuccess) {
