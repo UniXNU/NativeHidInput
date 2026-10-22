@@ -163,24 +163,32 @@ class NativeHidInput : public IOHIDDevice {
         // Sizes follow the axis maxima of the touch core: 30480 long, 20320 short, mapped to the same 0..32767 range.
         unsigned char report[1+TOUCH_FINGERS*6+1]={3};
         unsigned slot=0;
+        int nextIds[TOUCH_FINGERS],nextX[TOUCH_FINGERS],nextY[TOUCH_FINGERS];
         for(unsigned i=0;i<count && slot<TOUCH_FINGERS;++i,++slot) {
             unsigned x=transformCoordinate(xs[i],30480),y=transformCoordinate(ys[i],20320);
             unsigned char *f=report+1+slot*6;
             f[0]=1;f[1]=(unsigned char)(ids[i]&0xff);f[2]=(unsigned char)x;f[3]=(unsigned char)(x>>8);f[4]=(unsigned char)y;f[5]=(unsigned char)(y>>8);
-            self->prevIds[slot]=ids[i];self->prevX[slot]=(int)x;self->prevY[slot]=(int)y;
+            nextIds[slot]=ids[i];nextX[slot]=(int)x;nextY[slot]=(int)y;
         }
-        unsigned downCount=slot;
-        // Identifiers that were down and are gone: tip up at the last known position.
-        for(unsigned j=downCount;j<TOUCH_FINGERS;++j) {
-            if(self->prevIds[j]<0)continue;
-            if(slot<TOUCH_FINGERS) {
-                unsigned char *f=report+1+slot*6;
-                f[0]=2;f[1]=(unsigned char)(self->prevIds[j]&0xff);
-                f[2]=(unsigned char)self->prevX[j];f[3]=(unsigned char)(self->prevX[j]>>8);
-                f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
-                ++slot;
-            }
-            self->prevIds[j]=-1;
+        const unsigned downCount=slot;
+        // Identifiers that were down and are gone: tip up at the last known position. They are matched by identifier, not by slot:
+        // the producer packs its fingers, so when one lifts the others move down a slot and a slot match would lift a finger still
+        // down and leave the lifted one stuck.
+        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
+            const int id=self->prevIds[j];
+            if(id<0)continue;
+            bool kept=false;
+            for(unsigned i=0;i<downCount && !kept;++i)kept=(ids[i]&0xff)==(id&0xff);
+            if(kept || slot>=TOUCH_FINGERS)continue;
+            unsigned char *f=report+1+slot*6;
+            f[0]=2;f[1]=(unsigned char)(id&0xff);
+            f[2]=(unsigned char)self->prevX[j];f[3]=(unsigned char)(self->prevX[j]>>8);
+            f[4]=(unsigned char)self->prevY[j];f[5]=(unsigned char)(self->prevY[j]>>8);
+            ++slot;
+        }
+        for(unsigned j=0;j<TOUCH_FINGERS;++j) {
+            self->prevIds[j]=j<downCount?nextIds[j]:-1;
+            if(j<downCount){self->prevX[j]=nextX[j];self->prevY[j]=nextY[j];}
         }
         if(!slot)return;
         report[1+TOUCH_FINGERS*6]=(unsigned char)slot;
